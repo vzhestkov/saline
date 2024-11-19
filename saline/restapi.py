@@ -1,19 +1,42 @@
+import cgi
 import logging
 import os
 import ssl
 import tornado
+import tornado.gen
 import tornado.log
 import tornado.web
 
+from fnmatch import fnmatch
 from threading import Thread
 from time import time, sleep
+from tornado.escape import native_str
 from tornado.ioloop import IOLoop
-
 from tornado.iostream import StreamClosedError
-from salt.transport.ipc import IPCMessageSubscriber
+from uuid import uuid4
+
+from salt.auth import Resolver as AuthResolver
+from salt.transport.ipc import IPCMessageClient, IPCMessageSubscriber
 from salt.utils.asynchronous import current_ioloop as ctx_current_ioloop
+from salt.utils.json import import_json, loads as json_loads, dumps as json_dumps
+from salt.utils.yaml import safe_dump as yaml_safe_dump, safe_load as yaml_safe_load
+
 
 log = logging.getLogger(__name__)
+
+_json = import_json()
+
+AUTH_TOKEN_HEADER = "X-Auth-Token"
+AUTH_COOKIE_NAME = "saline_session_id"
+
+
+def _json_dumps(obj, **kwargs):
+    """
+    Invoke salt.utils.json.dumps using the alternate json module loaded using
+    salt.utils.json.import_json(). This ensures that we properly encode any
+    strings in the object before we perform the serialization.
+    """
+    return json_dumps(obj, _json_module=_json, **kwargs)
 
 
 class SalineChannels:
@@ -22,31 +45,237 @@ class SalineChannels:
         self.metrics_buf = None
         self.metrics_last = None
         self.metrics_timeout = opts.get("metrics_timeout", 120)
+        self.resp_buf = []
+        self.resp_refs = {}
 
     def run_channels(self):
         self.io_loop = IOLoop.current()
         self.pub_uri = os.path.join(self.opts["sock_dir"], "publisher.ipc")
+        self.pull_uri = os.path.join(self.opts["sock_dir"], "puller.ipc")
         with ctx_current_ioloop(self.io_loop):
             self.subscriber = IPCMessageSubscriber(self.pub_uri, io_loop=self.io_loop)
             self.subscriber.callbacks.add(self.channel_event_handler)
             for _ in range(5):
                 try:
-                    self.subscriber.connect(callback=self.channel_connected)
+                    self.subscriber.connect(
+                        timeout=1, callback=self.subscriber_connected
+                    )
                     break
                 except StreamClosedError:
                     sleep(1)
             self.io_loop.add_callback(self.subscriber.read_async)
+            self.pusher = IPCMessageClient(self.pull_uri, io_loop=self.io_loop)
+            for _ in range(5):
+                try:
+                    self.pusher.connect(timeout=1, callback=self.pusher_connected)
+                    break
+                except StreamClosedError:
+                    sleep(1)
 
-    def channel_connected(self, _):
+    def subscriber_connected(self, _):
         log.debug("Connected to Saline publisher channel")
         self.metrics_buf = ""
         self.metrics_last = time()
 
+    def pusher_connected(self, _):
+        log.debug("Connected to Saline puller channel")
+
+    @tornado.gen.coroutine
+    def send(self, msg, timeout=10):
+        ref = None
+        if isinstance(msg, dict) and "_ref" not in msg:
+            msg["_ref"] = ref = str(uuid4())
+        self.pusher.send(msg)
+        timeout_on = time() + timeout
+        timed_out = False
+        while not timed_out:
+            yield tornado.gen.sleep(0.1)
+            if ref is not None:
+                ret = self.resp_refs.pop(ref, None)
+            else:
+                try:
+                    ret = self.resp_buf.pop(0)
+                except IndexError:
+                    ret = None
+            if ret is not None:
+                raise tornado.gen.Return(ret)
+            timed_out = time() > timeout_on
+
+    @tornado.gen.coroutine
     def channel_event_handler(self, raw):
         log.trace("Received from Saline publisher: %s", raw)
         if "metrics" in raw:
             self.metrics_buf = raw["metrics"]
             self.metrics_last = time()
+        elif isinstance(raw, dict) and "_ref" in raw:
+            self.resp_refs[raw["_ref"]] = raw
+        else:
+            self.resp_buf.append(raw)
+
+
+class BaseAPIHandler(tornado.web.RequestHandler):  # pylint: disable=W0223
+    ct_out_map = (
+        ("application/json", _json_dumps),
+        ("application/x-yaml", yaml_safe_dump),
+    )
+
+    def prepare(self):
+        """
+        Run before get/posts etc. Pre-flight checks:
+            - verify that we can speak back to them (compatible accept header)
+        """
+        # Find an acceptable content-type
+        accept_header = self.request.headers.get("Accept", "*/*")
+        # Ignore any parameter, including q (quality) one
+        parsed_accept_header = [
+            cgi.parse_header(h)[0] for h in accept_header.split(",")
+        ]
+
+        def find_acceptable_content_type(parsed_accept_header):
+            for media_range in parsed_accept_header:
+                for content_type, dumper in self.ct_out_map:
+                    if fnmatch(content_type, media_range):
+                        return content_type, dumper
+            return None, None
+
+        content_type, dumper = find_acceptable_content_type(parsed_accept_header)
+
+        # better return message?
+        if not content_type:
+            self.send_error(406)
+
+        self.content_type = content_type
+        self.dumper = dumper
+
+        self.request_payload = self.deserialize(self.request.body)
+
+    def serialize(self, data):
+        """
+        Serlialize the output based on the Accept header
+        """
+        self.set_header("Content-Type", self.content_type)
+
+        return self.dumper(data)
+
+    def deserialize(self, data):
+        """
+        Deserialize the data based on request content type headers
+        """
+        ct_in_map = {
+            "application/json": json_loads,
+            "application/x-yaml": yaml_safe_load,
+            "text/yaml": yaml_safe_load,
+            "text/plain": json_loads,
+        }
+
+        nstr = native_str(data)
+        if nstr == "":
+            return None
+        try:
+            # Use cgi.parse_header to correctly separate parameters from value
+            value, parameters = cgi.parse_header(self.request.headers["Content-Type"])
+            return ct_in_map[value](nstr)
+        except KeyError:
+            self.send_error(406)
+        except ValueError:
+            self.send_error(400)
+
+    def options(self, *args, **kwargs):
+        """
+        Return CORS headers for preflight requests
+        """
+        # Allow X-Auth-Token in requests
+        request_headers = self.request.headers.get("Access-Control-Request-Headers")
+        allowed_headers = request_headers.split(",")
+
+        # Filter allowed header here if needed.
+
+        # Allow request headers
+        self.set_header("Access-Control-Allow-Headers", ",".join(allowed_headers))
+
+        # Allow X-Auth-Token in responses
+        self.set_header("Access-Control-Expose-Headers", "X-Auth-Token")
+
+        # Allow all methods
+        self.set_header("Access-Control-Allow-Methods", "OPTIONS, GET, POST")
+
+        self.set_status(204)
+        self.finish()
+
+    @property
+    def token(self):
+        """
+        The token used for the request
+        """
+        # find the token (cookie or headers)
+        if AUTH_TOKEN_HEADER in self.request.headers:
+            return self.request.headers[AUTH_TOKEN_HEADER]
+        else:
+            return self.get_cookie(AUTH_COOKIE_NAME)
+
+    def _verify_auth(self):
+        """
+        Verify if the token is valid
+        """
+        if self.token:
+            token_dict = self.application.auth_resolver.get_token(self.token)
+            if token_dict and token_dict.get("expire", 0) > time():
+                self.request.saline_user = token_dict.get("name")
+                return True
+        return False
+
+
+class LoginHandler(BaseAPIHandler):  # pylint: disable=W0223
+    def get(self):  # pylint: disable=arguments-differ
+        self.set_status(401)
+        self.set_header("WWW-Authenticate", "Session")
+
+        ret = {"status": "401 Unauthorized", "return": "Please log in"}
+
+        self.write(self.serialize(ret))
+
+    def post(self):  # pylint: disable=arguments-differ
+        try:
+            if not isinstance(self.request_payload, dict):
+                self.send_error(400)
+                return
+
+            creds = {
+                "username": self.request_payload["username"],
+                "password": self.request_payload["password"],
+                "eauth": self.request_payload["eauth"],
+            }
+        # if any of the args are missing, its a bad request
+        except KeyError:
+            self.send_error(400)
+            return
+
+        token_dict = self.application.auth_resolver.mk_token(creds)
+        if "token" not in token_dict:
+            self.set_status(401)
+            ret = {
+                "status": "401 Unauthorized",
+                "return": "The specified credentials are incorrect",
+            }
+            self.write(self.serialize(ret))
+            return
+        self.set_cookie(AUTH_COOKIE_NAME, token_dict["token"])
+
+        ret = {
+            "return": [
+                {
+                    "token": token_dict["token"],
+                    "expire": token_dict["expire"],
+                    "start": token_dict["start"],
+                    "user": token_dict["name"],
+                    "eauth": token_dict["eauth"],
+                }
+            ]
+        }
+
+        self.request.saline_user = token_dict.get("name")
+
+        self.write(self.serialize(ret))
 
 
 class MetricsHandler(tornado.web.RequestHandler):  # pylint: disable=W0223
@@ -69,6 +298,20 @@ class MetricsHandler(tornado.web.RequestHandler):  # pylint: disable=W0223
         self.finish()
 
 
+class StatsHandler(BaseAPIHandler):  # pylint: disable=W0223
+    @tornado.gen.coroutine
+    def get(self, rel_path=None):  # pylint: disable=arguments-differ
+        if not self._verify_auth():
+            self.redirect("/login")
+            return
+        if rel_path is None:
+            rel_path = "TOP"
+        if rel_path.startswith("/"):
+            rel_path = rel_path[1:]
+        ret = yield self.application.channels.send({"cmd": "stats", "stats": rel_path})
+        self.write(self.serialize(ret))
+
+
 def get_app(opts):
     """
     Returns a Tornado Web APP
@@ -78,6 +321,8 @@ def get_app(opts):
 
     paths = [
         (r"/metrics(/.*)?", MetricsHandler),
+        (r"/login", LoginHandler),
+        (r"/stats(/.*)?", StatsHandler),
     ]
 
     tornado_access_log = None
@@ -130,6 +375,13 @@ def get_app(opts):
     )
 
     app.channels = SalineChannels(opts)
+
+    auth_opts = {
+        "interface": opts.get("master_interface", "0.0.0.0"),
+        "ret_port": opts.get("master_ret_port", 4506),
+        "cython_enable": False,
+    }
+    app.auth_resolver = AuthResolver(auth_opts)
 
     return app
 

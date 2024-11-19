@@ -19,7 +19,7 @@ from saline.data.event import EventParser
 from saline.data.merger import DataMerger
 
 from salt.ext.tornado.ioloop import IOLoop, PeriodicCallback
-from salt.transport.ipc import IPCMessagePublisher
+from salt.transport.ipc import IPCMessagePublisher, IPCMessageServer
 from salt.utils.event import get_event
 from salt.utils.process import (
     ProcessManager,
@@ -353,6 +353,14 @@ class DataManager(SignalHandlingProcess):
             with salt.utils.files.set_umask(0o177):
                 self.publisher.start()
             self.io_loop.add_callback(self.metrics_publisher)
+            pull_uri = os.path.join(self.opts["sock_dir"], "puller.ipc")
+            self.puller = IPCMessageServer(
+                pull_uri,
+                io_loop=self.io_loop,
+                payload_handler=self.handle_message,
+            )
+            with salt.utils.files.set_umask(0o177):
+                self.puller.start()
             try:
                 self.io_loop.start()
             except KeyboardInterrupt:
@@ -360,6 +368,9 @@ class DataManager(SignalHandlingProcess):
 
     def stop_server(self):
         with self._close_lock:
+            if self.puller is not None:
+                self.puller.close()
+                self.puller = None
             if self.publisher is not None:
                 self.publisher.close()
                 self.publisher = None
@@ -383,6 +394,16 @@ class DataManager(SignalHandlingProcess):
                 last_update = cur_time
                 self.publisher.publish({"metrics": self.datamerger.get_metrics()})
             yield salt.ext.tornado.gen.sleep(3)
+
+    @salt.ext.tornado.gen.coroutine
+    def handle_message(self, msg, _):
+        ref = None
+        if isinstance(msg, dict):
+            ref = msg.pop("_ref", None)
+        ret = {"ret": msg}
+        if ref is not None:
+            ret["_ref"] = ref
+        self.publisher.publish(ret)
 
 
 class EventsReader(SignalHandlingProcess):
