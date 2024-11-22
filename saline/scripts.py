@@ -1,6 +1,23 @@
 import sys
 
 
+def saline_cmd():
+    """
+    Start the Saline CLI tool.
+    """
+
+    import saline.cmd
+
+    # Fix for setuptools generated scripts, so that it will
+    # work with multiprocessing fork emulation.
+    # (see multiprocessing.forking.get_preparation_data())
+    if __name__ != "__main__":
+        sys.modules["__main__"] = sys.modules[__name__]
+
+    salinecmd = saline.cmd.SalineCMD()
+    salinecmd.run()
+
+
 def saline_daemon():
     """
     Start the Saline.
